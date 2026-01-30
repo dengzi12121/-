@@ -1,0 +1,39 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 1. 基础参数设置
+Q0 = 100       # 初始容量 (Ah)
+I = 20         # 放电电流 (A)，假设恒流放电
+T_ref = 298.15 # 参考温度 (25°C 转化为开尔文)
+Ea_R = 5000    # 激活能与常数的比值 (假设值)
+time = np.linspace(0, 5, 100) # 模拟 5 小时
+
+def simulate_soc(temp_celsius):
+    T = temp_celsius + 273.15 # 摄氏度转开尔文
+    
+    # 计算温度修正因子 fT
+    fT = np.exp(Ea_R * (1/T_ref - 1/T))
+    
+    # 计算当前温度下的有效容量
+    # 这里为了演示暂不考虑老化因子 f_aging
+    Q_eff = Q0 * fT
+    
+    # 计算 SOC 随时间的变化
+    # SOC(t) = SOC_initial - (I * t) / Q_eff
+    soc = 1.0 - (I * time) / Q_eff
+    return np.clip(soc, 0, 1) # 电量最低为 0
+
+# 2. 执行模拟
+soc_room = simulate_soc(25)  # 25°C
+soc_cold = simulate_soc(-10) # -10°C
+
+# 3. 绘图
+plt.figure(figsize=(10, 6))
+plt.plot(time, soc_room * 100, label='25°C (Normal)', linewidth=2)
+plt.plot(time, soc_cold * 100, label='-10°C (Cold)', linestyle='--', linewidth=2)
+plt.title('SOC Decline: Room Temp vs. Cold Temp')
+plt.xlabel('Time (hours)')
+plt.ylabel('SOC (%)')
+plt.grid(True)
+plt.legend()
+plt.show()
