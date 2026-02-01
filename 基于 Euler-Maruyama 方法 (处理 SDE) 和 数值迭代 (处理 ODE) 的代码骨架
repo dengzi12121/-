@@ -1,0 +1,165 @@
+import numpy as np
+import math
+
+class BatteryConfig:
+    def __init__(self):
+        # 1. 基础物理参数
+        self.Q_nom = 4.0  # Ah (示例)
+        self.V_cut = 3.0  # V
+        self.V_term_min = 2.8 # 强制截止电压
+        
+        # 2. 电化学 (ECM) - 需通过 HPPC 拟合
+        self.R_ref = 0.05 # Ohm
+        self.E_a_R = 1000 # E_a/R (Arrhenius温度系数)
+        self.T_ref = 298.15 # 25 degC
+        
+        # 3. 热力学 - 需通过热测试拟合
+        self.C_c = 80.0 # J/K
+        self.C_s = 10.0 # J/K
+        self.R_cs = 2.0 # K/W
+        self.hA = 0.5   # W/K
+        
+        # 4. 控制与SDE参数
+        self.theta_P = 0.1
+        self.mu_P = {'Idle': 0.5, 'Screen': 3.0, 'Gaming': 8.0}
+        self.sigma_P = 0.5
+        self.sigma_soc = 1e-4 # SOC 状态不确定性
+        
+        # 控制逻辑
+        self.tau_ctrl = 1.0
+        self.K_T = 5.0
+        self.K_V = 5.0
+        self.k_smooth = 2.0
+        self.T_crit = 318.15 # 45 degC
+
+    def get_ocv(self, soc):
+        # 这里需要替换为真实的 OCV-SOC 查找表或函数
+        return 3.0 + 1.2 * soc 
+
+    def get_r0(self, T_c, soc):
+        # 对应图片中的 R0(Tc, S) 公式
+        return self.R_ref * np.exp(self.E_a_R * (1/T_c - 1/self.T_ref))
+
+class SimulationState:
+    def __init__(self, config):
+        self.t = 0.0
+        self.soc = 1.0
+        self.Y = np.log(self.soc / (1 - self.soc + 1e-9)) # Logit transform
+        self.P_req = 0.5 # 初始功率
+        self.T_c = 298.15
+        self.T_s = 298.15
+        self.z = 0.0 # 潜在控制状态
+        self.user_state = 'Screen' # 初始用户状态
+        
+        # 极化电压 (假设二阶模型)
+        self.U_p = np.array([0.0, 0.0]) 
+
+def step_simulation(state, config, dt, T_amb):
+    """
+    执行单步时间推进 (dt seconds)
+    """
+    # -----------------------------------------------------------
+    # 1. 用户状态转移 (User State Transition) - 简化为离散概率跳转
+    # 实际应根据 Q 矩阵计算转移概率 P = exp(Q*dt)
+    # state.user_state = update_markov_chain(...) 
+    
+    # -----------------------------------------------------------
+    # 2. 功率需求 SDE (Euler-Maruyama)
+    dW1 = np.random.normal(0, np.sqrt(dt))
+    mu = config.mu_P[state.user_state]
+    
+    # dP_req = theta * (mu - P)dt + sigma * sqrt(P) * dW
+    drift = config.theta_P * (mu - state.P_req)
+    diffusion = config.sigma_P * np.sqrt(max(state.P_req, 1e-3)) # 保护根号
+    state.P_req += drift * dt + diffusion * dW1
+    
+    # -----------------------------------------------------------
+    # 3. 反馈控制与有效功率 (Feedback Control)
+    # 计算控制状态 ODE: tau * z_dot = ...
+    # 软惩罚项
+    term_T = config.K_T * np.log(1 + np.exp(config.k_smooth * (state.T_c - config.T_crit)))
+    # 注意：V_term 在上一时刻是已知的，这里使用上一时刻估计值或近似处理
+    V_term_est = config.get_ocv(state.soc) - state.P_req / 3.8 * config.get_r0(state.T_c, state.soc) # 粗略估计用于控制反馈
+    term_V = config.K_V * np.log(1 + np.exp(config.k_smooth * (config.V_cut - V_term_est)))
+    
+    z_tgt = 5.0 # 假设目标 z (未限流状态)
+    dz = (1/config.tau_ctrl) * ((z_tgt - state.z) - term_T - term_V)
+    state.z += dz * dt
+    
+    # 计算节流系数 alpha (Sigmoid)
+    alpha = 1.0 / (1.0 + np.exp(-state.z))
+    P_eff = alpha * state.P_req
+    
+    # -----------------------------------------------------------
+    # 4. 电流闭环求解 (Algebraic Loop Closure)
+    # 求解 I 的二次方程: P_eff = I * (Voc - U_p - I*R0)
+    R0 = config.get_r0(state.T_c, state.soc)
+    U_total_p = np.sum(state.U_p)
+    V_oc_eff = config.get_ocv(state.soc) - U_total_p
+    
+    # 判别式 delta = V_oc_eff^2 - 4*R0*P_eff
+    delta = V_oc_eff**2 - 4 * R0 * P_eff
+    
+    if delta < 0:
+        # 系统强制截止 (根号下小于0，说明功率无法满足)
+        I_load = 0.0
+        system_shutdown = True
+    else:
+        I_load = (V_oc_eff - np.sqrt(delta)) / (2 * R0)
+        system_shutdown = False
+        
+    V_term = V_oc_eff - I_load * R0
+    
+    # -----------------------------------------------------------
+    # 5. 电-热耦合 (Thermal ODEs) - Euler Step
+    # 产热 Q_gen
+    Q_ohmic = I_load**2 * R0
+    Q_polar = 0 # 简化，需加上 sum(U_pi^2 / R_pi)
+    Q_gen = Q_ohmic + Q_polar + 0.1 * P_eff # 假设 device heat efficiency
+    
+    # 双节点热模型
+    dT_c = (Q_gen - (state.T_c - state.T_s)/config.R_cs) / config.C_c
+    dT_s = ((state.T_c - state.T_s)/config.R_cs - config.hA*(state.T_s - T_amb)) / config.C_s
+    
+    state.T_c += dT_c * dt
+    state.T_s += dT_s * dt
+    
+    # -----------------------------------------------------------
+    # 6. 电池状态 SDE (Logit Transform) - Euler-Maruyama
+    # dY(t) 公式
+    dW2 = np.random.normal(0, np.sqrt(dt))
+    
+    S = state.soc
+    # 防止分母为0
+    if 0.001 < S < 0.999:
+        term1 = - (I_load) / (3600 * config.Q_nom) * (1 / (S * (1-S))) # 假设 SOH=1
+        term2 = 0.5 * (config.sigma_soc**2) * (2*S - 1)
+        dY = (term1 + term2) * dt + config.sigma_soc * dW2
+        state.Y += dY
+        
+        # 物理 SOC 逆变换
+        state.soc = 1.0 / (1.0 + np.exp(-state.Y))
+    else:
+        # 边界处理
+        state.soc -= I_load * dt / (3600 * config.Q_nom)
+        
+    # -----------------------------------------------------------
+    # 7. 老化模型 (可选)
+    # 若需模拟 aging，在此处更新 SOH 和 R_ref
+    
+    return state.soc, V_term, state.T_c, system_shutdown
+
+# --- 运行示例 ---
+config = BatteryConfig()
+state = SimulationState(config)
+dt = 1.0 # 1秒步长
+times = []
+socs = []
+
+for i in range(3600): # 模拟1小时
+    soc, voltage, temp, done = step_simulation(state, config, dt, T_amb=298.15)
+    times.append(i)
+    socs.append(soc)
+    if done or soc <= 0:
+        print(f"Simulation ended at t={i}s")
+        break
