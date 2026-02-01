@@ -1,0 +1,350 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. 全局参数定义 (严格包含所有补充参数)
+# ==========================================
+PARAMS = {
+    # --- A. 电池本体 (Battery Physics) ---
+    'Q_nom': 3.20,          # [Ah] 标称容量
+    'V_cut_hard': 3.00,     # [V] 硬关机电压
+    'R0_ref': 0.025,        # [Ohm] 参考欧姆内阻 (25C)
+    'Ea_R': 4000.0,         # [K] 内阻活化能
+    'T_ref': 298.15,        # [K] 参考温度 (25C)
+    
+    # --- B. 极化支路 (2RC Model) [补充] ---
+    'R_p1': 0.010, 'tau_1': 10.0,   # 快速支路 (电荷转移)
+    'R_p2': 0.020, 'tau_2': 300.0,  # 慢速支路 (扩散)
+    
+    # --- C. PMIC 反馈控制 (Feedback) [补充] ---
+    'T_crit': 45.0,         # [C] 临界降频温度
+    'k_T': 2.0,             # [-] 温度Sigmoid陡峭度
+    'V_cut_soft': 3.30,     # [V] 软保护电压阈值
+    'k_V': 2.0,             # [-] 电压Sigmoid陡峭度
+    'lambda_v': 0.1,        # [-] 电压平滑系数 (EMA)
+    
+    # --- D. 功耗基准 (Logic/Base) ---
+    'P_idle': 0.05, 'P_screen': 0.60, 'P_gaming': 2.50,
+    
+    # --- E. 屏幕与射频 (Display & RF) ---
+    'P_driver': 0.30, 'c_pix': 2.50, 'gamma': 2.2,
+    'RSSI_ref': -65, 'P_rf_base': 0.10,
+    
+    # --- F. 随机动力学 (SDE) ---
+    'theta': 0.05,          # 功率均值回复速度
+    'sigma_p': 0.15,        # 功率波动率
+    'sigma_soc': 1e-4,      # SoC 估计噪声 (Logit SDE)
+    
+    # --- G. 热学模型 (Thermal) ---
+    'C_core': 55.0,         # [J/K] 核心热容
+    'C_surf': 15.0,         # [J/K] 表面热容 [补充]
+    'R_cs': 3.2,            # [K/W] 内-外热阻
+    'h_conv_base': 12.0,    # [W/m2K] 基准对流系数
+    'A_geo': 0.022,         # [m2] 几何表面积
+    'T_amb': 25.0,          # [C] 环境温度
+    
+    # --- H. 老化模型 (Aging) [补充] ---
+    'k_ref_aging': 1.0e-8,  # [s^-1] 日历老化基准
+    'Ea_aging': 25000.0,    # [J/mol] 老化活化能
+    'beta_soc': 2.0,        # [-] SOC 压力因子
+    'B_cyc': 3.0e-5,        # [Ah^-1] 循环老化基准
+    'gamma_I': 1.5,         # [-] 电流压力因子
+    'm_I': 1.8,             # [-] 电流幂律
+    'Gas_const': 8.314      # [J/mol K] 气体常数
+}
+
+# ==========================================
+# 2. 物理子模型函数
+# ==========================================
+
+def get_ocv(s):
+    """ OCV 曲线拟合 (LCO/Graphite) """
+    s = np.clip(s, 0.0, 1.0)
+    return 3.45 + 0.6*s - 0.05*(s**2) + 0.08*np.log(s+0.01) - 0.06*np.log(1.01-s)
+
+def get_r0_arrhenius(T_c_kelvin):
+    """ 内阻温度依赖 [图 8] """
+    # R0(T) = R_ref * exp(Ea/R * (1/T - 1/T_ref))
+    return PARAMS['R0_ref'] * np.exp(PARAMS['Ea_R'] * (1.0/T_c_kelvin - 1.0/PARAMS['T_ref']))
+
+def get_radio_power(rssi):
+    """ 射频功耗惩罚模型 """
+    penalty = np.maximum(0, (-65 - rssi) / 55.0)
+    return PARAMS['P_rf_base'] + 1.2 * (penalty ** 3)
+
+def get_thermal_efficiency(state):
+    """ 产热效率 eta_heat [图 66433... 修正] """
+    if state == 'Gaming': return 0.98
+    elif state == 'Screen': return 0.90
+    return 0.95 # Idle/Download
+
+def get_posture_factor(state):
+    """ 姿态散热系数 psi_posture [图 37848... 修正] """
+    if state == 'Idle': return 0.10     # Pocket
+    elif state == 'Screen': return 0.55 # Table
+    return 0.70                         # Handheld
+
+def get_phi_valid(I, T_c, soc):
+    """ 老化有效性掩码 Phi_valid [图 5] """
+    if soc <= 0: return 0.0
+    if T_c < -40 or T_c > 100: return 0.0
+    if I <= 0: return 0.0 # 仅计算放电损伤
+    return 1.0
+
+def sigmoid_protection(val, threshold, k):
+    """ PMIC 软开关 Sigmoid 函数 """
+    # 公式: 1 / (1 + exp(k * (val - threshold)))
+    # 注意方向: 
+    # 温度: T > T_crit 时 alpha 下降 -> exp(k*(T - T_crit))
+    # 电压: V < V_cut 时 alpha 下降 -> exp(k*(V_cut - V))
+    try:
+        res = 1.0 / (1.0 + np.exp(k * (val - threshold)))
+    except OverflowError:
+        res = 0.0
+    return res
+
+# ==========================================
+# 3. 仿真核心 (Strict Implementation)
+# ==========================================
+def run_full_simulation(profile, duration_hours=24, dt=1.0):
+    steps = int(duration_hours * 3600 / dt)
+    
+    # --- 初始化状态变量 ---
+    # 1. 电池状态
+    soc = 1.0
+    Y = np.log(soc / (1 - soc + 1e-9)) # Logit transform
+    
+    # 2. 热状态 (Kelvin for calc, C for display)
+    T_c = PARAMS['T_amb']
+    T_s = PARAMS['T_amb']
+    
+    # 3. 电路状态 (2RC)
+    U_p1 = 0.0
+    U_p2 = 0.0
+    
+    # 4. PMIC 状态
+    P_req = PARAMS['P_idle']
+    V_bar = get_ocv(1.0) # 初始平滑电压
+    
+    # 5. 老化状态
+    xi_loss = 0.0
+    
+    # --- 记录器 ---
+    rec_t = []
+    rec_soc = []
+    rec_temp = []
+    rec_p_eff = []
+    
+    # --- 解包用户配置 ---
+    prob_idle = profile['prob_idle']
+    prob_gaming = profile['prob_gaming']
+    rssi_mean = profile['rssi']
+    b_mean = profile['brightness']
+    apl_mean = profile['apl']
+    
+    current_state = 'Idle'
+    
+    for k in range(steps):
+        # -------------------------------------------------------
+        # 1. 用户行为层: CTMC (Discrete Step)
+        # -------------------------------------------------------
+        if k % 60 == 0:
+            r = np.random.random()
+            if r < prob_idle: current_state = 'Idle'
+            elif r < prob_idle + prob_gaming: current_state = 'Gaming'
+            else: current_state = 'Screen'
+            
+        # -------------------------------------------------------
+        # 2. 功率需求层: SDE [Image 2]
+        # -------------------------------------------------------
+        # 2.1 计算 Mu_total
+        if current_state == 'Idle':
+            p_logic = PARAMS['P_idle']; screen_on = False
+        elif current_state == 'Screen':
+            p_logic = PARAMS['P_screen']; screen_on = True
+        else:
+            p_logic = PARAMS['P_gaming']; screen_on = True
+            
+        p_disp = 0
+        if screen_on:
+            L = np.clip(np.random.normal(b_mean, 0.05), 0.1, 1.0)
+            APL = np.clip(np.random.normal(apl_mean, 0.1), 0.1, 1.0)
+            p_disp = PARAMS['P_driver'] + PARAMS['c_pix'] * L * (APL ** PARAMS['gamma'])
+            
+        curr_rssi = np.random.normal(rssi_mean, 5.0)
+        p_radio = get_radio_power(curr_rssi)
+        
+        mu_total = p_logic + p_disp + p_radio
+        
+        # 2.2 SDE Update
+        dW_p = np.random.normal(0, np.sqrt(dt))
+        # dP = theta*(mu-P)*dt + sigma*sqrt(P)*dW
+        drift_p = PARAMS['theta'] * (mu_total - P_req) * dt
+        diff_p = PARAMS['sigma_p'] * np.sqrt(max(0.01, P_req)) * dW_p
+        P_req += drift_p + diff_p
+        P_req = max(0.01, P_req)
+        
+        # -------------------------------------------------------
+        # 3. PMIC 控制层: Feedback Law [Image 2 & Supp]
+        # -------------------------------------------------------
+        # 3.1 节流系数 alpha (双Sigmoid)
+        # T_crit 保护: T > T_crit 时 alpha 下降
+        alpha_T = sigmoid_protection(T_c, PARAMS['T_crit'], PARAMS['k_T'])
+        # V_cut 保护: V_bar < V_cut 时 alpha 下降 (注意公式变换)
+        # Sigmoid input: k_V * (V_cut - V_bar). If V_bar low, input > 0, exp large, alpha small.
+        alpha_V = 1.0 / (1.0 + np.exp(PARAMS['k_V'] * (PARAMS['V_cut_soft'] - V_bar)))
+        
+        alpha = alpha_T * alpha_V
+        P_eff = alpha * P_req
+        
+        # -------------------------------------------------------
+        # 4. 电路层: 2RC + Arrhenius + Algebraic Loop [Image 3 & 4]
+        # -------------------------------------------------------
+        V_oc = get_ocv(soc)
+        T_c_K = T_c + 273.15
+        
+        # 4.1 更新 R0 (温度相关)
+        R0_curr = get_r0_arrhenius(T_c_K)
+        
+        # 4.2 计算有效开路电压 V_oc,eff
+        V_oc_eff = V_oc - U_p1 - U_p2
+        
+        # 4.3 求解电流 I (二次方程)
+        # I^2 * R0 - I * V_oc_eff + P_eff = 0
+        delta = V_oc_eff**2 - 4 * R0_curr * P_eff
+        if delta < 0: delta = 0
+        # 取物理可行根 (较小的电流值对应放电)
+        I = (V_oc_eff - np.sqrt(delta)) / (2 * R0_curr)
+        
+        # 4.4 计算瞬时端电压 V_term
+        V_term = V_oc_eff - I * R0_curr
+        
+        # 4.5 更新 V_bar (EMA)
+        V_bar = (1 - PARAMS['lambda_v']) * V_bar + PARAMS['lambda_v'] * V_term
+        
+        # 4.6 更新极化电压 (ODE Euler)
+        # dU_pi = (I*R_pi - U_pi)/tau_i * dt
+        U_p1 += (I * PARAMS['R_p1'] - U_p1) / PARAMS['tau_1'] * dt
+        U_p2 += (I * PARAMS['R_p2'] - U_p2) / PARAMS['tau_2'] * dt
+        
+        # -------------------------------------------------------
+        # 5. 热学层: 2-Node Model [Image 3 & Supp]
+        # -------------------------------------------------------
+        # 5.1 产热 Q_gen (严谨公式: I^2R + Polarization + Efficiency Loss)
+        # 注意: 之前讨论中 eta 作用于 P_eff. Image 5 公式:
+        # Q_gen = I^2*R0 + sum(Up^2/Rp) + eta_heat * P_eff
+        # 这里的 eta_heat 代表逻辑/屏幕/射频部分转化为热的比例
+        heat_joule = I**2 * R0_curr
+        heat_pol = (U_p1**2)/PARAMS['R_p1'] + (U_p2**2)/PARAMS['R_p2']
+        eta = get_thermal_efficiency(current_state)
+        # 户外特殊修正
+        if profile['label'].startswith('Outdoor'): eta = 0.85
+        heat_logic = eta * P_eff 
+        
+        Q_gen = heat_joule + heat_pol + heat_logic
+        
+        # 5.2 动态对流系数
+        psi = get_posture_factor(current_state)
+        hA_dynamic = PARAMS['h_conv_base'] * PARAMS['A_geo'] * psi
+        
+        # 5.3 温度 ODE
+        dT_c = (Q_gen - (T_c - T_s)/PARAMS['R_cs']) / PARAMS['C_core'] * dt
+        dT_s = ((T_c - T_s)/PARAMS['R_cs'] - hA_dynamic*(T_s - PARAMS['T_amb'])) / PARAMS['C_surf'] * dt
+        
+        T_c += dT_c
+        T_s += dT_s
+        
+        # -------------------------------------------------------
+        # 6. 老化层: Nonlinear Aging Integration [Image 5]
+        # -------------------------------------------------------
+        phi = get_phi_valid(I, T_c, soc)
+        if phi > 0:
+            # f_cal (Arrhenius)
+            f_cal = PARAMS['k_ref_aging'] * np.exp((PARAMS['Ea_aging']/PARAMS['Gas_const']) * (1/298.15 - 1/T_c_K))
+            # f_cyc (Stress factors)
+            # 公式: B_cyc * |I| * (1 + gamma * (|I|/Q_nom)^m)
+            # 注意: 这里简化 S 对 f_cal 的影响 beta，实际上 f_cal = k_ref * exp(...) * (1 + beta * sqrt(S))
+            f_cal *= (1 + PARAMS['beta_soc'] * np.sqrt(soc))
+            
+            c_rate = I / PARAMS['Q_nom']
+            f_cyc = PARAMS['B_cyc'] * I * (1 + PARAMS['gamma_I'] * (c_rate ** PARAMS['m_I']))
+            
+            xi_loss += (f_cal + f_cyc) * dt
+
+        # -------------------------------------------------------
+        # 7. SoC 层: SDE Update [Image 4]
+        # -------------------------------------------------------
+        # dY formula: - I / (3600 * Q * S * (1-S)) ... + Itô correction
+        # 保护 S 防止除零
+        S_safe = np.clip(soc, 1e-4, 1-1e-4)
+        term1 = - I / (3600.0 * PARAMS['Q_nom'] * S_safe * (1 - S_safe))
+        term2 = 0.5 * (PARAMS['sigma_soc']**2) * (2*S_safe - 1)
+        
+        dY = (term1 + term2) * dt + PARAMS['sigma_soc'] * np.random.normal(0, np.sqrt(dt))
+        Y += dY
+        
+        # 逆变换 Logit -> Sigmoid
+        soc = 1.0 / (1.0 + np.exp(-Y))
+        
+        # -------------------------------------------------------
+        # 8. 记录与终止
+        # -------------------------------------------------------
+        if k % 60 == 0:
+            rec_t.append(k * dt / 3600.0)
+            rec_soc.append(soc * 100)
+            rec_temp.append(T_s)
+            rec_p_eff.append(P_eff)
+            
+        if soc <= 0.01 or V_term <= PARAMS['V_cut_hard']:
+            rec_t.append(k * dt / 3600.0)
+            rec_soc.append(0)
+            rec_temp.append(T_s)
+            rec_p_eff.append(0)
+            break
+            
+    return np.array(rec_t), rec_soc, rec_temp, xi_loss
+
+# ==========================================
+# 4. 执行多场景仿真
+# ==========================================
+profiles = [
+    {'label': 'Office/Light', 'prob_idle': 0.90, 'prob_gaming': 0.0, 'rssi': -55, 'brightness': 0.25, 'apl': 0.2},
+    {'label': 'Gamer/Heavy',  'prob_idle': 0.10, 'prob_gaming': 0.60, 'rssi': -80, 'brightness': 0.70, 'apl': 0.7},
+    {'label': 'Outdoor',      'prob_idle': 0.50, 'prob_gaming': 0.05, 'rssi': -110,'brightness': 1.00, 'apl': 0.6}
+]
+
+colors = ['#2ecc71', '#e74c3c', '#f39c12']
+
+plt.figure(figsize=(10, 10))
+
+# Subplot 1: SoC Curve
+plt.subplot(2, 1, 1)
+for p, c in zip(profiles, colors):
+    print(f"Simulating {p['label']}...")
+    t, s, temp, loss = run_full_simulation(p, duration_hours=24)
+    p['data'] = (t, s, temp) # Store for next plot
+    p['loss'] = loss
+    
+    plt.plot(t, s, label=f"{p['label']} (Loss: {loss*1e4:.2f}e-4)", color=c, linewidth=2)
+    plt.text(t[-1], s[-1]+2, f"{t[-1]:.1f}h", color=c, fontweight='bold')
+
+plt.title('SoC Drain (Full Physics Model)', fontsize=12)
+plt.ylabel('SoC (%)')
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.legend()
+
+# Subplot 2: Temperature & Aging
+plt.subplot(2, 1, 2)
+for p, c in zip(profiles, colors):
+    t, s, temp = p['data']
+    plt.plot(t, temp, label=p['label'], color=c, linewidth=1.5)
+
+plt.axhline(PARAMS['T_crit'], color='gray', linestyle='--', label='Throttling Threshold')
+plt.title('Surface Temperature Dynamics', fontsize=12)
+plt.ylabel('Temperature (°C)')
+plt.xlabel('Time (Hours)')
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.legend()
+
+plt.tight_layout()
+plt.show()
