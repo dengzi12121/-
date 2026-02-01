@@ -1,0 +1,146 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. 老化参数数量级修正 (Optimization)
+# ==========================================
+# 目标：Heavy User 约 2-3 年 (800-1000次循环) 衰减至 80%
+# 计算逻辑倒推：
+# 总寿命 20% = 0.2
+# 总吞吐电量 ≈ 1000 cycles * 3.2Ah * 3600s = 1.15e7 Coulombs
+# B_cyc ≈ 0.2 / 1.15e7 ≈ 1.7e-8
+
+OPTIMIZED_AGING_PARAMS = {
+    # 日历老化: 极其缓慢，主要是存放时的自然衰减
+    'k_ref_aging': 2.0e-11,  # 原值 5e-9 -> 缩小 250倍
+    
+    # 循环老化: 每次充放电的损伤 (关键参数)
+    'B_cyc': 1.5e-8,         # 原值 8e-5 -> 缩小 5000倍 (对应每库仑损伤)
+    
+    # 加速因子: 保持不变
+    'gamma_R': 1.5,          # 内阻增长
+    'beta_soc': 2.0,         # 高电量压力
+    'Ea_aging': 25000.0      # 温度敏感度
+}
+
+# 更新全局参数
+PARAMS.update(OPTIMIZED_AGING_PARAMS)
+
+print("✅ Aging Parameters Optimized for ~3 Years Lifespan")
+
+# ==========================================
+# 2. 长周期仿真器 (逻辑微调)
+# ==========================================
+def simulate_lifecycle_optimized(user_profile, max_years=4, jump_days=15):
+    """
+    jump_days: 步长建议设小一点(如15天)，曲线更平滑
+    """
+    current_soh = 1.0
+    
+    # 记录
+    history = {
+        'days': [0],
+        'soh': [100.0],
+        'resistance': [PARAMS['R0_ref'] * 1000] # mOhm
+    }
+    
+    total_days = max_years * 365
+    current_day = 0
+    
+    # 备份原始物理参数 (因为循环中会修改它们)
+    original_q = PARAMS['Q_nom']
+    original_r = PARAMS['R0_ref'] # 25mOhm
+    
+    print(f"Simulating {user_profile['label']} ({max_years} years)...")
+    
+    while current_day < total_days and current_soh > 0.70: # 跑到 70% 停止
+        # -----------------------------------
+        # A. 物理参数退化 (Feedback)
+        # -----------------------------------
+        # 容量减小
+        PARAMS['Q_nom'] = original_q * current_soh
+        
+        # 内阻增加 (Death Spiral 关键)
+        # R_new = R_old * (1 + gamma * (1-SOH))
+        # 当 SOH=0.8时, R 增加 1.5*0.2 = 30%
+        r_growth = 1.0 + PARAMS['gamma_R'] * (1.0 - current_soh)
+        PARAMS['R0_ref'] = original_r * r_growth
+        
+        # -----------------------------------
+        # B. 运行单日微观仿真
+        # -----------------------------------
+        # 运行 24小时，获得这一天的损伤 xi_loss
+        # 注意：这里调用的是那个"返回4个值"的函数
+        _, _, _, daily_loss = run_full_simulation(user_profile, duration_hours=24)
+        
+        # -----------------------------------
+        # C. 宏观跳跃
+        # -----------------------------------
+        # 假设未来 jump_days 天的使用情况相同
+        step_loss = daily_loss * jump_days
+        current_soh -= step_loss
+        current_day += jump_days
+        
+        # -----------------------------------
+        # D. 记录
+        # -----------------------------------
+        history['days'].append(current_day)
+        history['soh'].append(current_soh * 100)
+        history['resistance'].append(PARAMS['R0_ref'] * 1000)
+
+    # 还原参数，避免污染
+    PARAMS['Q_nom'] = original_q
+    PARAMS['R0_ref'] = original_r
+    
+    return history
+
+# ==========================================
+# 3. 执行对比
+# ==========================================
+
+# A. 养生用户 (每天只用 40% 电，温度低)
+profile_light = {
+    'label': 'Light User (Office)',
+    'prob_idle': 0.85, 'prob_gaming': 0.0, 
+    'rssi': -60, 'brightness': 0.3, 'apl': 0.3
+}
+
+# B. 重度用户 (每天两充，温度高，电流大)
+profile_heavy = {
+    'label': 'Heavy User (Gamer)',
+    'prob_idle': 0.1, 'prob_gaming': 0.5, # 每天玩很久
+    'rssi': -85, 'brightness': 0.8, 'apl': 0.7
+}
+
+res_light = simulate_lifecycle_optimized(profile_light, max_years=5)
+res_heavy = simulate_lifecycle_optimized(profile_heavy, max_years=5)
+
+# ==========================================
+# 4. 绘图 (双轴显示)
+# ==========================================
+fig, ax1 = plt.subplots(figsize=(10, 6))
+
+# 左轴: SOH
+ax1.set_xlabel('Time (Years)', fontsize=12)
+ax1.set_ylabel('State of Health (%)', fontsize=12)
+line1, = ax1.plot(np.array(res_light['days'])/365, res_light['soh'], color='#2ecc71', linewidth=3, label='Light User (SOH)')
+line2, = ax1.plot(np.array(res_heavy['days'])/365, res_heavy['soh'], color='#e74c3c', linewidth=3, label='Heavy User (SOH)')
+
+# 80% 寿命线
+ax1.axhline(80, color='gray', linestyle='--', alpha=0.5)
+ax1.text(0.1, 81, 'End of Life (80%)', color='gray')
+
+# 右轴: 内阻
+ax2 = ax1.twinx()
+ax2.set_ylabel('Internal Resistance (mΩ)', fontsize=12)
+line3, = ax2.plot(np.array(res_light['days'])/365, res_light['resistance'], color='#2ecc71', linestyle=':', alpha=0.6, label='Light User (R0)')
+line4, = ax2.plot(np.array(res_heavy['days'])/365, res_heavy['resistance'], color='#e74c3c', linestyle=':', alpha=0.6, label='Heavy User (R0)')
+
+# 合并图例
+lines = [line1, line2, line3, line4]
+labels = [l.get_label() for l in lines]
+ax1.legend(lines, labels, loc='lower left')
+
+plt.title('Realistic Long-Term Aging Prediction (3-5 Years)', fontsize=14)
+plt.grid(True, linestyle='--', alpha=0.3)
+plt.show()
