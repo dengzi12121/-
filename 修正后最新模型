@@ -1,0 +1,222 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. 模型参数定义 (加入热学修正参数)
+# ==========================================
+PARAMS = {
+    # --- 电池物理 ---
+    'Q_nom': 3.20, 'V_cut': 3.30, 'R0_ref': 0.025,
+    
+    # --- 功耗基准 ---
+    'P_idle': 0.05, 'P_screen': 0.60, 'P_gaming': 2.50,
+    
+    # --- 屏幕 & 射频 ---
+    'P_driver': 0.30, 'c_pix': 2.50, 'gamma': 2.2,
+    'RSSI_ref': -65, 'P_rf_base': 0.10,
+    
+    # --- SDE ---
+    'theta': 0.05, 'sigma': 0.15,
+    
+    # --- 热学 (UPDATED) ---
+    'C_core': 55.0,  # J/K
+    'R_cs': 3.2,     # K/W
+    'T_amb': 25.0,   # C
+    
+    # [NEW] 几何与对流参数
+    # 之前的 hA = 0.18 是一个综合值。
+    # 现在拆解为: h_conv (W/m2K) * A_geo (m2)
+    # 假设 h_conv ≈ 12 (自然对流), A_geo ≈ 0.02 (6.7寸手机) -> max hA ≈ 0.24
+    'h_conv': 12.0,       # W/(m^2*K) 自然对流系数
+    'A_geo': 0.022        # m^2 iPhone 14 Pro 表面积估算
+}
+
+# 辅助函数保持不变
+def get_ocv(s):
+    s = np.clip(s, 0.0, 1.0)
+    return 3.45 + 0.6*s - 0.05*(s**2) + 0.08*np.log(s+0.01) - 0.06*np.log(1.01-s)
+
+def get_radio_power(rssi):
+    penalty = np.maximum(0, (-65 - rssi) / 55.0)
+    return PARAMS['P_rf_base'] + 1.2 * (penalty ** 3)
+
+# ==========================================
+# [NEW] 2. 状态依赖的物理系数函数 (基于图片)
+# ==========================================
+
+def get_thermal_efficiency(state):
+    """
+    图片 1: eta_heat(X) - 多少电能转化为热能
+    """
+    if state == 'Gaming':
+        return 0.98 # CPU主导，几乎全发热
+    elif state == 'Screen':
+        return 0.90 # 屏幕主导，光能逃逸 (约10%)
+    elif state == 'Idle': 
+        # 图片中是 'Download'=0.85。我们假设 Idle 如果有后台下载也类似
+        # 或者普通 Idle 为 0.95。这里为了体现射频影响，取折中
+        return 0.95 
+    # 对于 Outdoor 场景，稍后在主循环里做特殊处理会更精准
+    return 0.98
+
+def get_posture_factor(state):
+    """
+    图片 2 & 3: psi_posture(t) - 暴露面积系数
+    """
+    if state == 'Idle':
+        return 0.10 # Pocket Mode: 放在口袋，绝热严重
+    elif state == 'Screen':
+        return 0.55 # Table Mode: 放桌上，背面被挡
+    elif state == 'Gaming':
+        return 0.70 # Handheld Mode: 手持，手遮挡一部分
+    return 0.50
+
+# ==========================================
+# 3. 仿真核心引擎 (Updated)
+# ==========================================
+def simulate_battery_drain(user_profile, duration_hours=24, dt=1.0):
+    total_steps = int(duration_hours * 3600 / dt)
+    
+    soc = 1.0; T_c = PARAMS['T_amb']; T_s = PARAMS['T_amb']; P_req = PARAMS['P_idle']
+    soc_history = []; temp_history = []; time_history = []
+    
+    prob_idle = user_profile['prob_idle']
+    prob_gaming = user_profile['prob_gaming']
+    rssi_mean = user_profile['rssi']
+    brightness_mean = user_profile['brightness']
+    apl_mean = user_profile['apl']
+    
+    current_state = 'Idle'
+    
+    for step in range(total_steps):
+        # --- A. 状态切换 ---
+        if step % 60 == 0:
+            rand = np.random.random()
+            if rand < prob_idle: current_state = 'Idle'
+            elif rand < prob_idle + prob_gaming: current_state = 'Gaming'
+            else: current_state = 'Screen'
+            
+        # --- B. 功率计算 ---
+        if current_state == 'Idle':
+            p_logic = PARAMS['P_idle']; is_screen_on = False
+        elif current_state == 'Screen':
+            p_logic = PARAMS['P_screen']; is_screen_on = True
+        else:
+            p_logic = PARAMS['P_gaming']; is_screen_on = True
+            
+        p_disp = 0
+        if is_screen_on:
+            L = np.clip(np.random.normal(brightness_mean, 0.05), 0.1, 1.0)
+            APL = np.clip(np.random.normal(apl_mean, 0.1), 0.1, 1.0)
+            p_disp = PARAMS['P_driver'] + PARAMS['c_pix'] * L * (APL ** PARAMS['gamma'])
+            
+        curr_rssi = np.random.normal(rssi_mean, 5.0)
+        p_radio = get_radio_power(curr_rssi)
+        
+        mu_total = p_logic + p_disp + p_radio
+        
+        # --- C. SDE ---
+        noise = np.random.normal(0, np.sqrt(dt))
+        drift = PARAMS['theta'] * (mu_total - P_req) * dt
+        diffusion = PARAMS['sigma'] * np.sqrt(max(0.1, P_req)) * noise
+        P_req += drift + diffusion
+        P_req = max(0.05, P_req)
+        
+        # --- D. 电流 ---
+        V_oc = get_ocv(soc)
+        R_inner = PARAMS['R0_ref'] * np.exp(4000 * (1/(T_c+273.15) - 1/298.15))
+        try:
+            term = V_oc**2 - 4*R_inner*P_req
+            if term < 0: term = 0
+            I = (V_oc - np.sqrt(term)) / (2*R_inner)
+        except: I = P_req / 3.8
+        
+        # --- E. 热学更新 (核心修正点) ---
+        
+        # 1. 计算热生成效率 eta
+        eta = get_thermal_efficiency(current_state)
+        # 如果是户外高亮高射频，手动修正一下 eta，因为 radio 占比大
+        if user_profile['label'].startswith('Outdoor'): 
+            # 户外大量能量是射频辐射出去的，eta 应该更低
+            eta = 0.85 
+            
+        Q_gen = P_req * eta # [Correction 1]
+        
+        # 2. 计算有效对流面积 A(t)
+        psi = get_posture_factor(current_state)
+        current_hA = PARAMS['h_conv'] * PARAMS['A_geo'] * psi # [Correction 2]
+        
+        dT_c = (Q_gen - (T_c - T_s)/PARAMS['R_cs']) / PARAMS['C_core'] * dt
+        dT_s = ((T_c - T_s)/PARAMS['R_cs'] - current_hA*(T_s - PARAMS['T_amb'])) / 120.0 * dt
+        
+        T_c += dT_c
+        T_s += dT_s
+        
+        # --- F. SoC ---
+        soc -= I * dt / (3600.0 * PARAMS['Q_nom'])
+        
+        # --- G. 记录 ---
+        current_time_hour = step * dt / 3600.0
+        if step % 60 == 0: 
+            soc_history.append(soc * 100)
+            temp_history.append(T_s) # 记录一下温度，很有趣
+            time_history.append(current_time_hour)
+        if soc <= 0:
+            soc_history.append(0)
+            temp_history.append(T_s)
+            time_history.append(current_time_hour)
+            break
+            
+    return np.array(time_history), soc_history, temp_history
+
+# ==========================================
+# 4. 场景与绘图 (保持不变)
+# ==========================================
+profile_office = {
+    'label': 'Office / Light', 'prob_idle': 0.90, 'prob_gaming': 0.0,
+    'rssi': -55, 'brightness': 0.25, 'apl': 0.2
+}
+profile_gamer = {
+    'label': 'Heavy / Gamer', 'prob_idle': 0.10, 'prob_gaming': 0.60,
+    'rssi': -80, 'brightness': 0.7, 'apl': 0.7
+}
+profile_outdoor = {
+    'label': 'Outdoor / Travel', 'prob_idle': 0.50, 'prob_gaming': 0.05,
+    'rssi': -110, 'brightness': 1.0, 'apl': 0.6
+}
+
+# 绘制 SoC 曲线
+plt.figure(figsize=(12, 5))
+
+# 子图1: 电量
+plt.subplot(1, 2, 1)
+profiles = [profile_office, profile_gamer, profile_outdoor]
+colors = ['#2ecc71', '#e74c3c', '#f39c12']
+
+for p, c in zip(profiles, colors):
+    t, soc, temp = simulate_battery_drain(p, duration_hours=24)
+    plt.plot(t, soc, label=p['label'], color=c, linewidth=2.5)
+    plt.text(t[-1], soc[-1]+2, f"{t[-1]:.1f}h", ha='right', color=c, fontweight='bold')
+    
+    # 顺便存一下 temp 用于画图2
+    p['temp_data'] = (t, temp)
+
+plt.title('SoC Drain (w/ Thermal Corrections)', fontsize=12)
+plt.ylabel('SoC (%)')
+plt.xlabel('Time (h)')
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.legend()
+
+# 子图2: 表面温度 (新增，为了展示姿态因子的影响)
+plt.subplot(1, 2, 2)
+for p, c in zip(profiles, colors):
+    t, temp = p['temp_data']
+    plt.plot(t, temp, label=p['label'], color=c, linewidth=1.5, alpha=0.8)
+
+plt.title('Surface Temperature (T_s)', fontsize=12)
+plt.ylabel('Temp (°C)')
+plt.xlabel('Time (h)')
+plt.grid(True, linestyle='--', alpha=0.5)
+
+plt.tight_layout()
+plt.show()
