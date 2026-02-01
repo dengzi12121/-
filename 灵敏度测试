@@ -1,0 +1,154 @@
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ==========================================
+# 0. 准备工作：封装仿真接口
+# ==========================================
+def get_runtime_for_sensitivity(override_params, override_profile):
+    """
+    运行一次仿真并返回续航时间 (小时)
+    """
+    # 1. 备份并更新全局 PARAMS
+    original_params = PARAMS.copy()
+    PARAMS.update(override_params)
+    
+    # 2. 运行仿真
+    t, soc, _ = simulate_battery_drain(override_profile, duration_hours=24)
+    
+    # 3. 恢复全局 PARAMS (非常重要，防止污染后续测试)
+    PARAMS.update(original_params)
+    
+    # 4. 返回最终时间 (即 SoC 归零或结束的时间)
+    return t[-1]
+
+# ==========================================
+# 1. 定义测试用例 (Tornado Analysis Plan)
+# ==========================================
+
+# 定义一个"标准混合用户"作为基准 (Baseline)
+baseline_profile = {
+    'label': 'Baseline User',
+    'prob_idle': 0.3, 
+    'prob_gaming': 0.4, # 基准玩游戏概率
+    'rssi': -85,        # 基准信号
+    'brightness': 0.6,  # 基准亮度
+    'apl': 0.5
+}
+baseline_params = {} # 不修改物理常数
+
+# 计算基准续航
+baseline_runtime = get_runtime_for_sensitivity(baseline_params, baseline_profile)
+print(f"Baseline Runtime: {baseline_runtime:.2f} Hours")
+
+# 定义灵敏度因子
+factors = [
+    {
+        'name': 'Signal Strength (RSSI)',
+        'param_type': 'profile', 'key': 'rssi',
+        'low': -115, 'high': -55, 
+        'label_low': '-115dBm (Poor)', 'label_high': '-55dBm (Good)'
+    },
+    {
+        'name': 'Screen Brightness',
+        'param_type': 'profile', 'key': 'brightness',
+        'low': 1.0, 'high': 0.2, 
+        'label_low': '100% (Outdoor)', 'label_high': '20% (Night)'
+    },
+    {
+        'name': 'Gaming Habit',
+        'param_type': 'profile', 'key': 'prob_gaming',
+        'low': 0.8, 'high': 0.1, 
+        'label_low': '80% Time', 'label_high': '10% Time'
+    },
+    {
+        'name': 'Ambient Temp',
+        'param_type': 'global', 'key': 'T_amb',
+        'low': 35.0, 'high': 10.0, 
+        'label_low': '35°C (Hot)', 'label_high': '10°C (Cool)'
+    },
+    {
+        'name': 'Heat Dissipation (h_conv)',
+        'param_type': 'global', 'key': 'h_conv',
+        'low': 5.0, 'high': 25.0, 
+        'label_low': '5 (Pocket/Bed)', 'label_high': '25 (Fan)'
+    }
+]
+
+# ==========================================
+# 2. 执行测试循环
+# ==========================================
+results = []
+
+for f in factors:
+    # --- 测试 Low Case (通常是更差的情况) ---
+    if f['param_type'] == 'profile':
+        # 修改 Profile
+        p_low = baseline_profile.copy()
+        p_low[f['key']] = f['low']
+        time_low = get_runtime_for_sensitivity({}, p_low)
+        
+        # 修改 Profile (High)
+        p_high = baseline_profile.copy()
+        p_high[f['key']] = f['high']
+        time_high = get_runtime_for_sensitivity({}, p_high)
+    else:
+        # 修改 Global Params
+        time_low = get_runtime_for_sensitivity({f['key']: f['low']}, baseline_profile)
+        time_high = get_runtime_for_sensitivity({f['key']: f['high']}, baseline_profile)
+    
+    # 记录结果：(因子名, 低值对应时间, 高值对应时间)
+    results.append({
+        'name': f['name'],
+        'time_low': time_low,
+        'time_high': time_high,
+        'range': abs(time_high - time_low),
+        'label_low': f['label_low'],
+        'label_high': f['label_high']
+    })
+
+# 按影响幅度排序 (Range)
+results.sort(key=lambda x: x['range'], reverse=True)
+
+# ==========================================
+# 3. 绘制旋风图 (Tornado Plot)
+# ==========================================
+fig, ax = plt.subplots(figsize=(10, 6))
+
+y_pos = np.arange(len(results))
+factor_names = [r['name'] for r in results]
+
+# 绘制基准线
+ax.axvline(baseline_runtime, color='black', linestyle='--', linewidth=1, label=f'Baseline ({baseline_runtime:.1f}h)')
+
+for i, r in enumerate(results):
+    # 确定哪端是左，哪端是右 (时间短在左，时间长在右)
+    min_t = min(r['time_low'], r['time_high'])
+    max_t = max(r['time_low'], r['time_high'])
+    
+    # 绘制条形
+    # 红色段：从 Baseline 到 Min_t (负面影响)
+    if min_t < baseline_runtime:
+        ax.barh(i, baseline_runtime - min_t, left=min_t, height=0.5, color='#e74c3c', alpha=0.8)
+        # 标注 Worse Case 的具体条件
+        label_pos_x = min_t - 0.2
+        ax.text(label_pos_x, i, r['label_low'] if r['time_low'] < r['time_high'] else r['label_high'], 
+                va='center', ha='right', fontsize=9, color='#c0392b')
+
+    # 绿色段：从 Baseline 到 Max_t (正面影响)
+    if max_t > baseline_runtime:
+        ax.barh(i, max_t - baseline_runtime, left=baseline_runtime, height=0.5, color='#2ecc71', alpha=0.8)
+        # 标注 Better Case 的具体条件
+        label_pos_x = max_t + 0.2
+        ax.text(label_pos_x, i, r['label_high'] if r['time_high'] > r['time_low'] else r['label_low'], 
+                va='center', ha='left', fontsize=9, color='#27ae60')
+
+ax.set_yticks(y_pos)
+ax.set_yticklabels(factor_names, fontsize=11, fontweight='bold')
+ax.set_xlabel('Battery Runtime (Hours)', fontsize=11)
+ax.set_title('Sensitivity Analysis (Tornado Plot)', fontsize=14)
+ax.set_xlim(0, 14) # 根据结果调整视野
+ax.grid(True, axis='x', linestyle='--', alpha=0.5)
+ax.legend()
+
+plt.tight_layout()
+plt.show()
