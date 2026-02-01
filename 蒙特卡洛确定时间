@@ -1,0 +1,190 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+import time
+
+# ==========================================
+# 1. 模型配置 (PhoneBatteryConfig)
+# ==========================================
+class PhoneBatteryConfig:
+    def __init__(self):
+        # 物理规格 (4.32Ah, 4.45V)
+        self.Q_nom = 4.323  
+        self.V_max = 4.45   
+        self.V_min = 3.00   
+        
+        # 热力学参数 (手机被动散热)
+        self.Mass = 0.065   
+        self.C_c = 65.0     
+        self.C_s = 15.0     
+        self.R_cs = 4.0     
+        self.hA = 2.5       
+        
+        # 电化学参数
+        self.R_ref = 0.025  
+        self.E_a_R = 1000.0 
+        self.T_ref = 298.15 
+        
+        # 随机负载参数
+        self.theta_P = 0.5  
+        self.mu_P = {'Idle': 0.1, 'Screen': 1.5, 'Gaming': 7.0}
+        self.sigma_P_dict = {'Idle': 0.02, 'Screen': 0.5, 'Gaming': 1.5}
+        
+        # 控制参数
+        self.tau_ctrl = 5.0   
+        self.K_T = 8.0        
+        self.T_crit = 318.15  
+        self.k_smooth = 1.0   
+        
+        # OCV 曲线
+        self.soc_points = np.array([0.0, 0.05, 0.1, 0.2, 0.5, 0.8, 0.9, 0.98, 1.0])
+        self.ocv_points = np.array([3.0, 3.3, 3.5, 3.65, 3.8, 4.1, 4.25, 4.4, 4.45])
+        self.ocv_func = interp1d(self.soc_points, self.ocv_points, kind='linear', fill_value='extrapolate')
+
+    def get_ocv(self, soc):
+        return float(self.ocv_func(soc))
+
+    def get_r0(self, T_c, soc):
+        return self.R_ref * np.exp(self.E_a_R * (1/T_c - 1/self.T_ref))
+
+# ==========================================
+# 2. 仿真状态
+# ==========================================
+class SimulationState:
+    def __init__(self, config):
+        self.soc = 1.0      
+        self.P_req = 0.1    
+        self.T_c = 298.15   
+        self.T_s = 298.15   
+        self.z = 10.0       
+        self.user_state = 'Idle' 
+
+# ==========================================
+# 3. 单步求解器
+# ==========================================
+def step_simulation(state, config, dt, T_amb=298.15):
+    # 马尔可夫链状态转移
+    r = np.random.rand()
+    # 稍微调整转移概率以增加随机性
+    if state.user_state == 'Idle':
+        if r < 0.02: state.user_state = 'Screen' 
+    elif state.user_state == 'Screen':
+        if r < 0.01: state.user_state = 'Gaming' 
+        elif r < 0.02: state.user_state = 'Idle'  
+    elif state.user_state == 'Gaming':
+        if r < 0.01: state.user_state = 'Screen' 
+    
+    # 功率 SDE
+    mu = config.mu_P[state.user_state]
+    sigma = config.sigma_P_dict[state.user_state]
+    dW = np.random.normal(0, np.sqrt(dt)) # 注意：若dt非1，噪声需缩放
+    state.P_req += config.theta_P * (mu - state.P_req) * dt + sigma * dW
+    state.P_req = max(0.01, state.P_req)
+    
+    # 控制回路
+    term_T = config.K_T * np.log(1 + np.exp(config.k_smooth * (state.T_c - config.T_crit)))
+    dz = (1/config.tau_ctrl) * ((10.0 - state.z) - term_T)
+    state.z += dz * dt
+    alpha = 1.0 / (1.0 + np.exp(-state.z))
+    P_eff = alpha * state.P_req
+    
+    # 电路求解
+    R0 = config.get_r0(state.T_c, state.soc)
+    Voc = config.get_ocv(state.soc)
+    delta = Voc**2 - 4 * R0 * P_eff
+    
+    if delta < 0:
+        I_load = Voc / (2*R0)
+    else:
+        I_load = (Voc - np.sqrt(delta)) / (2 * R0)
+        
+    V_term = Voc - I_load * R0
+    
+    # 热求解
+    Q_gen = I_load**2 * R0 + P_eff * 0.15 
+    dT_c = (Q_gen - (state.T_c - state.T_s)/config.R_cs) / config.C_c
+    dT_s = ((state.T_c - state.T_s)/config.R_cs - config.hA*(state.T_s - T_amb)) / config.C_s
+    state.T_c += dT_c * dt
+    state.T_s += dT_s * dt
+    
+    # SOC 更新
+    state.soc -= I_load * dt / (config.Q_nom * 3600)
+    
+    return state.soc, V_term
+
+# ==========================================
+# 4. 蒙特卡洛预测器 (Monte Carlo Predictor)
+# ==========================================
+class MonteCarloPredictor:
+    def __init__(self, n_simulations=50):
+        self.n = n_simulations
+        self.config = PhoneBatteryConfig()
+        self.results = []
+        
+    def run(self):
+        print(f"Running {self.n} simulations to predict battery life distribution...")
+        start_time = time.time()
+        
+        # 模拟设置：最大 12 小时, dt = 5.0s (加速计算)
+        dt = 5.0
+        max_steps = int(12 * 3600 / dt)
+        
+        for i in range(self.n):
+            state = SimulationState(self.config)
+            runtime = 0
+            
+            for step in range(max_steps):
+                soc, v_term = step_simulation(state, self.config, dt)
+                
+                # 终止条件
+                if soc <= 0.01 or v_term < self.config.V_min:
+                    runtime = step * dt
+                    break
+            
+            if runtime == 0: runtime = 12 * 3600 # 没跑完算满
+            self.results.append(runtime / 3600.0) # 转为小时
+            
+            # 简单的进度条
+            if (i+1) % 10 == 0:
+                print(f"  Processed {i+1}/{self.n} runs...")
+                
+        print(f"Simulation completed in {time.time() - start_time:.2f}s")
+        self.analyze_and_plot()
+        
+    def analyze_and_plot(self):
+        times = np.array(self.results)
+        mean_t = np.mean(times)
+        std_t = np.std(times)
+        p10 = np.percentile(times, 10)
+        p90 = np.percentile(times, 90)
+        
+        print("\n" + "="*40)
+        print("      BATTERY LIFETIME PREDICTION")
+        print("="*40)
+        print(f"Average Runtime : {mean_t:.2f} hours")
+        print(f"Uncertainty     : +/- {std_t:.2f} hours")
+        print(f"Worst Case (P10): {p10:.2f} hours")
+        print(f"Best Case  (P90): {p90:.2f} hours")
+        print("="*40 + "\n")
+        
+        # 绘图
+        plt.figure(figsize=(10, 6))
+        plt.hist(times, bins=10, color='skyblue', edgecolor='black', alpha=0.7)
+        plt.axvline(mean_t, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_t:.2f}h')
+        plt.axvline(p10, color='green', linestyle=':', linewidth=2, label='Risk Range (P10-P90)')
+        plt.axvline(p90, color='green', linestyle=':', linewidth=2)
+        
+        plt.xlabel('Battery Runtime (Hours)')
+        plt.ylabel('Probability / Frequency')
+        plt.title(f'Predicted Battery Life Distribution (N={self.n})')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.show()
+
+# ==========================================
+# 5. 执行
+# ==========================================
+if __name__ == "__main__":
+    predictor = MonteCarloPredictor(n_simulations=50) # 跑50次
+    predictor.run()
