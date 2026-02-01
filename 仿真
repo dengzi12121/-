@@ -1,0 +1,163 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+
+# ==========================================
+# 1. 模型配置 (iPhone 14 Pro Max 级别经验参数)
+# ==========================================
+class PhoneBatteryConfig:
+    def __init__(self):
+        # --- 物理规格 ---
+        self.Q_nom = 4.323  # Ah (标称容量)
+        self.V_max = 4.45   # V (高压钴酸锂/三元体系)
+        self.V_min = 3.00   # V (截止电压)
+        
+        # --- 几何与热力学 (关键差异点) ---
+        # 手机电池扁平且散热差
+        self.Mass = 0.065   # kg (约65g)
+        self.C_c = 65.0     # J/K (核心热容, c_p ≈ 1000 J/kgK)
+        self.C_s = 15.0     # J/K (封装与保护板热容)
+        self.R_cs = 4.0     # K/W (电芯内部到表面的导热热阻)
+        self.hA = 2.5       # W/K (表面对环境的被动散热系数，手机通常在2-3之间)
+        
+        # --- 电化学参数 ---
+        # 假设直流内阻 (DCR) 约为 25 mOhm
+        self.R_ref = 0.025  
+        self.E_a_R = 1000.0 # Arrhenius 活化能系数
+        self.T_ref = 298.15 # 参考温度 25°C
+        
+        # --- 随机负载模型 (SDE) ---
+        self.theta_P = 0.5  # 均值回归速度
+        # 定义三种典型用户状态的功率均值 (Watts)
+        self.mu_P = {
+            'Idle': 0.1,    # 后台待机
+            'Screen': 1.5,  # 刷短视频/社交
+            'Gaming': 7.0   # 重负载游戏 (参考极客湾原神测试数据)
+        }
+        # 功率波动率 (Gaming 状态波动大)
+        self.sigma_P_dict = {'Idle': 0.02, 'Screen': 0.5, 'Gaming': 1.5}
+        
+        # --- 反馈控制 (PMIC) ---
+        self.tau_ctrl = 5.0   # 控制回路时间常数
+        self.K_T = 8.0        # 温度保护增益 (越大约敏感)
+        self.T_crit = 318.15  # 45°C 触发温控
+        self.k_smooth = 1.0   # Softplus 平滑度
+        
+        # --- 合成 OCV 曲线 (高压平台) ---
+        # 使用关键点插值模拟真实的 OCV
+        self.soc_points = np.array([0.0, 0.05, 0.1, 0.2, 0.5, 0.8, 0.9, 0.98, 1.0])
+        self.ocv_points = np.array([3.0, 3.3, 3.5, 3.65, 3.8, 4.1, 4.25, 4.4, 4.45])
+        self.ocv_func = interp1d(self.soc_points, self.ocv_points, kind='linear', fill_value='extrapolate')
+
+    def get_ocv(self, soc):
+        return float(self.ocv_func(soc))
+
+    def get_r0(self, T_c, soc):
+        # 内阻随温度升高而降低
+        return self.R_ref * np.exp(self.E_a_R * (1/T_c - 1/self.T_ref))
+
+# ==========================================
+# 2. 仿真状态容器
+# ==========================================
+class SimulationState:
+    def __init__(self):
+        self.t = 0.0
+        self.soc = 1.0      # 初始 100%
+        self.P_req = 0.1    # 初始功率
+        self.T_c = 298.15   # 初始 25°C
+        self.T_s = 298.15
+        self.z = 5.0        # 初始控制状态 (无限制)
+        self.user_state = 'Idle'
+
+# ==========================================
+# 3. 核心求解器 (Step Function)
+# ==========================================
+def step_simulation(state, config, dt, T_amb=298.15):
+    # --- A. 用户状态转移 (Markov Chain) ---
+    r = np.random.rand()
+    # 简化的转移逻辑
+    if state.user_state == 'Idle':
+        if r < 0.01: state.user_state = 'Screen' # 1% 概率唤醒
+    elif state.user_state == 'Screen':
+        if r < 0.005: state.user_state = 'Gaming' # 0.5% 概率开始游戏
+        elif r < 0.01: state.user_state = 'Idle'
+    elif state.user_state == 'Gaming':
+        if r < 0.005: state.user_state = 'Screen' # 0.5% 概率退出游戏
+    
+    # --- B. 功率需求 SDE (Ornstein-Uhlenbeck) ---
+    mu = config.mu_P[state.user_state]
+    sigma = config.sigma_P_dict[state.user_state]
+    dW = np.random.normal(0, np.sqrt(dt))
+    
+    # dP = theta * (mu - P) * dt + sigma * dW
+    state.P_req += config.theta_P * (mu - state.P_req) * dt + sigma * dW
+    state.P_req = max(0.01, state.P_req) # 物理约束
+    
+    # --- C. PMIC 反馈控制 (Throttling) ---
+    # 计算热惩罚项: Softplus(T - T_crit)
+    term_T = config.K_T * np.log(1 + np.exp(config.k_smooth * (state.T_c - config.T_crit)))
+    
+    # 控制状态动力学
+    z_tgt = 10.0 # 目标完全开放
+    dz = (1/config.tau_ctrl) * ((z_tgt - state.z) - term_T)
+    state.z += dz * dt
+    
+    # 计算节流系数 alpha (0~1)
+    alpha = 1.0 / (1.0 + np.exp(-state.z))
+    P_eff = alpha * state.P_req # 实际允许输出的功率
+    
+    # --- D. 电路方程求解 (代数环) ---
+    # P_eff = I * V_term = I * (Voc - I*R0)
+    # 解一元二次方程: R0*I^2 - Voc*I + P_eff = 0
+    R0 = config.get_r0(state.T_c, state.soc)
+    Voc = config.get_ocv(state.soc)
+    
+    delta = Voc**2 - 4 * R0 * P_eff
+    
+    if delta < 0:
+        I_load = Voc / (2*R0) # 物理极限
+        shutdown = True
+    else:
+        I_load = (Voc - np.sqrt(delta)) / (2 * R0)
+        shutdown = False
+        
+    V_term = Voc - I_load * R0
+    
+    # --- E. 热动力学 ODE ---
+    # 产热 = 焦耳热 I^2R + 芯片发热 (假设部分传导至电池)
+    Q_gen = I_load**2 * R0 + P_eff * 0.15 
+    
+    dT_c = (Q_gen - (state.T_c - state.T_s)/config.R_cs) / config.C_c
+    dT_s = ((state.T_c - state.T_s)/config.R_cs - config.hA*(state.T_s - T_amb)) / config.C_s
+    
+    state.T_c += dT_c * dt
+    state.T_s += dT_s * dt
+    
+    # --- F. SOC 更新 ---
+    state.soc -= I_load * dt / (config.Q_nom * 3600)
+    
+    return {
+        'Time': state.t, 'SOC': state.soc, 'Voltage': V_term, 
+        'Temp': state.T_c - 273.15, 'Power': P_eff, 'State': state.user_state
+    }
+
+# ==========================================
+# 4. 运行主程序
+# ==========================================
+if __name__ == "__main__":
+    config = PhoneBatteryConfig()
+    state = SimulationState()
+    
+    results = []
+    # 模拟 1.5 小时 (5400秒)
+    for t in range(5400):
+        data = step_simulation(state, config, dt=1.0)
+        results.append(data)
+        state.t += 1.0
+        if data['SOC'] <= 0 or data['Voltage'] < config.V_min:
+            print(f"Battery dead at {t}s")
+            break
+            
+    # 数据可视化 (此处代码省略，请参考上方生成的图表)
+    print("Simulation finished. Data points:", len(results))
